@@ -35,6 +35,7 @@ class StorageManager:
         self.novels_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.history_manager = SearchHistoryManager(self.output_dir / ".search_history.json")
 
     def save_novel(self, post_data: Dict[str, Any], save_format: str = "txt") -> Path:
         """
@@ -167,3 +168,74 @@ class StorageManager:
 
         logger.info(f"[{title}] 图片下载完成: 成功 {downloaded_count}/{total}")
         return downloaded_count
+
+    def save_search_list_to_csv(self, search_results: List[Dict[str, Any]], filename: str = "search_results.csv") -> Path:
+        """
+        导出关键词搜索结果列表为 CSV 清单
+        """
+        file_path = self.data_dir / filename
+        fieldnames = ["index", "title", "date", "series", "categorys", "tags", "url", "snippet"]
+
+        with open(file_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for idx, item in enumerate(search_results, 1):
+                raw_content = item.get("content", "").replace("\r", " ").replace("\n", " ").strip()
+                snippet = raw_content[:150] + ("..." if len(raw_content) > 150 else "")
+                writer.writerow({
+                    "index": idx,
+                    "title": item.get("title", ""),
+                    "date": item.get("date", ""),
+                    "series": item.get("series", ""),
+                    "categorys": item.get("categorys", ""),
+                    "tags": item.get("tags", ""),
+                    "url": item.get("url", item.get("permalink", "")),
+                    "snippet": snippet
+                })
+
+        logger.info(f"已导出搜索结果清单 (共 {len(search_results)} 条) 至 CSV: {file_path}")
+        return file_path
+
+
+class SearchHistoryManager:
+    """管理搜索历史记录"""
+    def __init__(self, history_file: Path, max_history: int = 20):
+        self.history_file = Path(history_file)
+        self.max_history = max_history
+
+    def get_history(self) -> List[str]:
+        if not self.history_file.exists():
+            return []
+        try:
+            with open(self.history_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+        except Exception as e:
+            logger.warning(f"读取搜索历史出错: {e}")
+        return []
+
+    def add_history(self, keyword: str) -> None:
+        keyword = keyword.strip()
+        if not keyword:
+            return
+        history = self.get_history()
+        if keyword in history:
+            history.remove(keyword)
+        history.insert(0, keyword)
+        history = history[:self.max_history]
+
+        try:
+            self.history_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.history_file, "w", encoding="utf-8") as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存搜索历史出错: {e}")
+
+    def clear_history(self) -> None:
+        try:
+            if self.history_file.exists():
+                self.history_file.unlink()
+                logger.info("已清空搜索历史记录")
+        except Exception as e:
+            logger.warning(f"清空搜索历史出错: {e}")

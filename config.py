@@ -31,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = BASE_DIR / "output"
 NOVELS_DIR = OUTPUT_DIR / "novels"
 IMAGES_DIR = OUTPUT_DIR / "images"
+VIDEOS_DIR = OUTPUT_DIR / "videos"
 DATA_DIR = OUTPUT_DIR / "data"
 
 # 默认请求配置
