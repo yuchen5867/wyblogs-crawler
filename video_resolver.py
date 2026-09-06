@@ -21,6 +21,7 @@ from bs4 import BeautifulSoup
 import imageio_ffmpeg
 
 from config import DEFAULT_HEADERS, TIMEOUT
+import ui
 
 logger = logging.getLogger("wyblogs_spider")
 
@@ -355,25 +356,36 @@ class VideoDownloader:
         self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
     def resolve_stream(self, video_url: str) -> Optional[Dict[str, Any]]:
-        """智能路由解析视频流"""
+        """智能路由解析视频流，集成动态转圈加载动画"""
+        short_url = video_url[:45] + "..." if len(video_url) > 45 else video_url
+
         if VoeResolver.is_voe(video_url):
-            res = VoeResolver.resolve(video_url, self.session)
-            if res:
-                return res
+            with ui.show_status(f"正在逆向解析 VOE 视频直链: {short_url}"):
+                res = VoeResolver.resolve(video_url, self.session)
+                if res:
+                    ui.print_success(f"VOE 视频直链解析成功 [{res.get('type')}]")
+                    return res
 
         if LuluvidResolver.is_luluvid(video_url):
-            res = LuluvidResolver.resolve(video_url, self.session)
-            if res:
-                return res
+            with ui.show_status(f"正在解密 Luluvid 混淆流: {short_url}"):
+                res = LuluvidResolver.resolve(video_url, self.session)
+                if res:
+                    ui.print_success(f"Luluvid 混淆流还原成功 [{res.get('type')}]")
+                    return res
 
         if PixeldrainResolver.is_pixeldrain(video_url):
-            res = PixeldrainResolver.resolve(video_url)
-            if res:
-                return res
+            with ui.show_status(f"正在转换 Pixeldrain 网盘直链: {short_url}"):
+                res = PixeldrainResolver.resolve(video_url)
+                if res:
+                    ui.print_success("Pixeldrain 直链转换成功")
+                    return res
 
         # 尝试使用 Playwright 嗅探兜底
-        logger.info(f"专用解析器未匹配，尝试启用 Playwright 嗅探: {video_url}")
-        return PlaywrightFallbackSniffer.sniff(video_url)
+        with ui.show_status(f"启用无头浏览器嗅探媒体流: {short_url}"):
+            res = PlaywrightFallbackSniffer.sniff(video_url)
+            if res:
+                ui.print_success("浏览器嗅探媒体流成功")
+            return res
 
     def download_stream(
         self,
@@ -381,7 +393,7 @@ class VideoDownloader:
         output_file: Path,
         label: str = "视频"
     ) -> bool:
-        """根据流类型执行下载"""
+        """根据流类型执行下载，带有 Claude Code 风格平滑进度条"""
         stream_type = stream_info.get("type")
         stream_url = stream_info.get("stream_url")
         headers = stream_info.get("headers", {})
@@ -391,56 +403,46 @@ class VideoDownloader:
 
         # 1. 直接 MP4 / HTTP 静态文件下载
         if stream_type in ["mp4", "direct"]:
-            logger.info(f"开始高速拉取 MP4 直链: [{label}] -> {output_file.name}")
+            ui.print_info(f"开始高速拉取 MP4 直链: [{label}] -> {output_file.name}")
             try:
                 with self.session.get(stream_url, headers=headers, stream=True, timeout=30) as r:
                     if r.status_code != 200:
-                        logger.warning(f"下载请求状态码异常 {r.status_code}: {stream_url}")
+                        ui.print_warning(f"下载请求状态码异常 {r.status_code}: {stream_url}")
                         return False
 
                     total_size = int(r.headers.get("content-length", 0))
-                    downloaded = 0
-                    start_t = time.time()
-                    last_log_t = start_t
+                    disp_name = output_file.name if len(output_file.name) <= 24 else output_file.name[:21] + "..."
 
-                    with open(part_file, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=1024 * 512):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                now = time.time()
-                                if now - last_log_t > 3.0:
-                                    last_log_t = now
-                                    mb_done = downloaded / (1024 * 1024)
-                                    if total_size > 0:
-                                        percent = downloaded / total_size * 100
-                                        total_mb = total_size / (1024 * 1024)
-                                        logger.info(f"下载进度 [{label}]: {mb_done:.1f}MB / {total_mb:.1f}MB ({percent:.1f}%)")
-                                    else:
-                                        logger.info(f"下载进度 [{label}]: {mb_done:.1f}MB")
+                    with ui.create_download_progress() as progress:
+                        task_id = progress.add_task(f"下载: {disp_name}", total=total_size if total_size > 0 else None)
+                        with open(part_file, "wb") as f:
+                            for chunk in r.iter_content(chunk_size=1024 * 512):
+                                if chunk:
+                                    f.write(chunk)
+                                    progress.update(task_id, advance=len(chunk))
 
                 if part_file.exists() and part_file.stat().st_size > 1024:
                     if output_file.exists():
                         output_file.unlink()
                     part_file.rename(output_file)
                     total_mb = output_file.stat().st_size / (1024 * 1024)
-                    logger.info(f"[{label}] 视频下载完成！总大小: {total_mb:.2f} MB")
+                    ui.print_success(f"[{label}] 视频下载完成！大小: {total_mb:.2f} MB")
                     return True
                 else:
-                    logger.warning(f"下载文件大小异常: {part_file}")
+                    ui.print_warning(f"下载文件大小异常: {part_file}")
                     if part_file.exists():
                         part_file.unlink()
                     return False
 
             except Exception as e:
-                logger.error(f"下载 MP4 发生异常: {e}")
+                ui.print_error(f"下载 MP4 发生异常: {e}")
                 if part_file.exists():
                     part_file.unlink()
                 return False
 
         # 2. HLS m3u8 切片流，调用内置 FFmpeg 合成转码为 MP4
         elif stream_type == "m3u8":
-            logger.info(f"检测到 HLS 切片流，正在调用内置 FFmpeg 无损合并转码: [{label}] -> {output_file.name}")
+            ui.print_info(f"检测到 HLS 切片流，调用内置 FFmpeg 无损合并: [{label}] -> {output_file.name}")
             referer = headers.get("Referer", "https://wyblogs.eu.org/")
             ua = headers.get("User-Agent", DEFAULT_HEADERS["User-Agent"])
 
@@ -455,22 +457,24 @@ class VideoDownloader:
             ]
 
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                with ui.show_status(f"FFmpeg 正在合并转码 [{label}]，请稍候..."):
+                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+                
                 if proc.returncode == 0 and part_file.exists() and part_file.stat().st_size > 1024:
                     if output_file.exists():
                         output_file.unlink()
                     part_file.rename(output_file)
                     total_mb = output_file.stat().st_size / (1024 * 1024)
-                    logger.info(f"[{label}] HLS 视频切片合并完成！总大小: {total_mb:.2f} MB")
+                    ui.print_success(f"[{label}] HLS 视频切片合并完成！大小: {total_mb:.2f} MB")
                     return True
                 else:
-                    logger.warning(f"FFmpeg 转码失败: code={proc.returncode}, stderr tail:\n{proc.stderr[-500:]}")
+                    ui.print_warning(f"FFmpeg 转码失败: code={proc.returncode}, stderr tail:\n{proc.stderr[-500:]}")
                     if part_file.exists():
                         part_file.unlink()
                     return False
 
             except Exception as e:
-                logger.error(f"FFmpeg 执行异常: {e}")
+                ui.print_error(f"FFmpeg 执行异常: {e}")
                 if part_file.exists():
                     part_file.unlink()
                 return False

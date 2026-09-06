@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any
 import requests
+import ui
 
 logger = logging.getLogger("wyblogs_spider")
 
@@ -124,7 +125,7 @@ class StorageManager:
 
     def download_post_images(self, post_data: Dict[str, Any], session: requests.Session) -> int:
         """
-        下载指定文章的所有图片到对应的独立文件夹中
+        下载指定文章的所有图片到对应的独立文件夹中，集成进度条展示
         """
         title = post_data.get("title", "未命名写真")
         images = post_data.get("images", [])
@@ -137,36 +138,42 @@ class StorageManager:
 
         downloaded_count = 0
         total = len(images)
-        logger.info(f"开始下载 [{title}] 的 {total} 张图片...")
+        disp_title = title if len(title) <= 22 else title[:19] + "..."
 
-        for idx, img_info in enumerate(images, 1):
-            img_url = img_info["url"]
-            ext = ".jpg"
-            if ".png" in img_url.lower():
-                ext = ".png"
-            elif ".webp" in img_url.lower():
-                ext = ".webp"
-            elif ".gif" in img_url.lower():
-                ext = ".gif"
+        with ui.create_counter_progress(unit="张") as progress:
+            task_id = progress.add_task(f"下载图集: {disp_title}", total=total)
 
-            img_file = post_img_dir / f"{idx:03d}{ext}"
-            if img_file.exists() and img_file.stat().st_size > 0:
-                downloaded_count += 1
-                continue
+            for idx, img_info in enumerate(images, 1):
+                img_url = img_info["url"]
+                ext = ".jpg"
+                if ".png" in img_url.lower():
+                    ext = ".png"
+                elif ".webp" in img_url.lower():
+                    ext = ".webp"
+                elif ".gif" in img_url.lower():
+                    ext = ".gif"
 
-            try:
-                # 附带 Referer 防盗链
-                headers = {"Referer": post_data.get("url", "")}
-                resp = session.get(img_url, headers=headers, timeout=15)
-                if resp.status_code == 200:
-                    img_file.write_bytes(resp.content)
+                img_file = post_img_dir / f"{idx:03d}{ext}"
+                if img_file.exists() and img_file.stat().st_size > 0:
                     downloaded_count += 1
-                else:
-                    logger.warning(f"图片下载返回状态码 {resp.status_code}: {img_url}")
-            except Exception as e:
-                logger.warning(f"图片下载失败 {img_url}: {e}")
+                    progress.update(task_id, advance=1)
+                    continue
 
-        logger.info(f"[{title}] 图片下载完成: 成功 {downloaded_count}/{total}")
+                try:
+                    # 附带 Referer 防盗链
+                    headers = {"Referer": post_data.get("url", "")}
+                    resp = session.get(img_url, headers=headers, timeout=15)
+                    if resp.status_code == 200:
+                        img_file.write_bytes(resp.content)
+                        downloaded_count += 1
+                    else:
+                        logger.warning(f"图片下载返回状态码 {resp.status_code}: {img_url}")
+                except Exception as e:
+                    logger.warning(f"图片下载失败 {img_url}: {e}")
+                
+                progress.update(task_id, advance=1)
+
+        ui.print_success(f"[{title}] 写真套图下载完成: 成功 {downloaded_count}/{total} 张")
         return downloaded_count
 
     def save_search_list_to_csv(self, search_results: List[Dict[str, Any]], filename: str = "search_results.csv") -> Path:
