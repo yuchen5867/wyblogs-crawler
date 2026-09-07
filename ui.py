@@ -1022,3 +1022,100 @@ def show_status(message: str):
         spinner="dots",
         spinner_style="bright_cyan"
     )
+
+def render_post_links_panel(post_data: Dict[str, Any], saved_guide_path: Optional[Any] = None):
+    """
+    当视频自动下载受限或用户需要网盘/直链时，在终端中以高亮卡片直观呈现所有网盘与视频源链接
+    """
+    import json
+    from storage import identify_link_platform
+
+    title = escape(str(post_data.get("title", "未命名文章")))
+    url = escape(str(post_data.get("url", "")))
+
+    download_links = post_data.get("download_links", [])
+    video_links = post_data.get("video_links", [])
+
+    if isinstance(download_links, str):
+        try:
+            download_links = json.loads(download_links)
+        except Exception:
+            download_links = []
+    if isinstance(video_links, str):
+        try:
+            video_links = json.loads(video_links)
+        except Exception:
+            video_links = []
+
+    t = Table(box=box.ROUNDED, show_header=True, header_style="bold bright_cyan", expand=True)
+    t.add_column("分类", width=8, justify="center")
+    t.add_column("平台 / 主机", width=14, justify="center")
+    t.add_column("真实下载 / 播放地址 (可直接复制)", ratio=3, style="bold bright_white")
+    t.add_column("操作指引", ratio=2, style="dim white")
+
+    # 1. 网盘类
+    for it in download_links:
+        u = it.get("url") if isinstance(it, dict) else str(it)
+        if not u:
+            continue
+        info = identify_link_platform(u)
+        color = "magenta"
+        if "Google" in info["name"]:
+            color = "green"
+        elif "MEGA" in info["name"]:
+            color = "bright_red"
+        elif "TeraBox" in info["name"]:
+            color = "bright_cyan"
+
+        t.add_row(
+            "[bold magenta]网盘[/bold magenta]",
+            f"[bold {color}]{escape(info['name'])}[/bold {color}]",
+            escape(u),
+            escape(info["desc"])
+        )
+
+    # 2. 视频主机类
+    for it in video_links:
+        u = it.get("url") if isinstance(it, dict) else str(it)
+        if not u:
+            continue
+        info = identify_link_platform(u)
+        color = "bright_yellow"
+        if "Streamtape" in info["name"]:
+            color = "bright_blue"
+        elif "VOE" in info["name"]:
+            color = "bright_cyan"
+        elif "Luluvid" in info["name"]:
+            color = "bright_green"
+
+        t.add_row(
+            "[bold yellow]视频[/bold yellow]",
+            f"[bold {color}]{escape(info['name'])}[/bold {color}]",
+            escape(u),
+            escape(info["desc"])
+        )
+
+    if not download_links and not video_links:
+        t.add_row(
+            "[dim]-[/dim]",
+            "[dim]未检测到外链[/dim]",
+            "[dim]原站页面暂未提取到有效外部链接（可能已失效或下架）[/dim]",
+            f"[dim]原文: {url}[/dim]"
+        )
+
+    sub_text = "[dim]💡 提示: 可直接复制上方链接在浏览器打开，或使用 IDM 嗅探 / 网盘客户端转存高速下载[/dim]"
+    if saved_guide_path:
+        sub_text = f"[bold bright_yellow]指南文件已自动保存至: {escape(str(saved_guide_path))}[/bold bright_yellow]"
+
+    panel = Panel(
+        t,
+        title=f"[bold bright_white]── 【{title}】网盘与视频直链清单 (可手动下载) ──[/bold bright_white]",
+        title_align="left",
+        box=box.ROUNDED,
+        border_style="bright_yellow",
+        subtitle=sub_text,
+        subtitle_align="center"
+    )
+    console.print()
+    console.print(panel)
+

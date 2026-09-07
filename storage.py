@@ -6,8 +6,9 @@ import re
 import csv
 import json
 import logging
+import urllib.parse
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import requests
 import ui
 
@@ -18,6 +19,58 @@ _WIN_RESERVED = {
     *(f"COM{i}" for i in range(1, 10)),
     *(f"LPT{i}" for i in range(1, 10)),
 }
+
+
+def identify_link_platform(url: str) -> Dict[str, str]:
+    """识别外链平台类型并返回分类、平台名称与指引说明"""
+    if not url:
+        return {"category": "other", "name": "未知", "desc": "外部链接"}
+    try:
+        netloc = urllib.parse.urlparse(str(url)).netloc.lower()
+    except Exception:
+        return {"category": "other", "name": "外部链接", "desc": "外部链接"}
+
+    # 网盘类 (Cloud Drives)
+    if "drive.google.com" in netloc:
+        return {"category": "cloud", "name": "Google Drive", "desc": "Google 云端硬盘 (支持免限速转存/直接下载)"}
+    elif "mega.nz" in netloc or "mega.co.nz" in netloc:
+        return {"category": "cloud", "name": "MEGA 网盘", "desc": "MEGA 国际云盘 (支持客户端免登录不限速下载与转存)"}
+    elif any(k in netloc for k in ["terabox", "1024terabox"]):
+        return {"category": "cloud", "name": "TeraBox", "desc": "百度海外版网盘 (支持客户端批量转存与高速下载)"}
+    elif "pixeldrain" in netloc:
+        return {"category": "cloud", "name": "Pixeldrain", "desc": "Pixeldrain 免登录直链网盘 (支持直接高速下载)"}
+    elif "krakenfiles" in netloc:
+        return {"category": "cloud", "name": "KrakenFiles", "desc": "KrakenFiles 免费网盘 (网页点击 Download 即可获取文件)"}
+    elif "drop.download" in netloc:
+        return {"category": "cloud", "name": "DropDownload", "desc": "DropDownload 国际网盘"}
+    elif "files.fm" in netloc:
+        return {"category": "cloud", "name": "Files.fm", "desc": "Files.fm 网盘"}
+
+    # 视频主机类 (Video Hosts)
+    if "streamtape" in netloc:
+        return {"category": "video", "name": "Streamtape", "desc": "主流视频主机 (网页带原生 Download 按钮，推荐用浏览器+去广告插件或 IDM 嗅探)"}
+    elif "voe.sx" in netloc:
+        return {"category": "video", "name": "VOE", "desc": "VOE 视频主机 (支持网页在线原画播放与右下角直接下载)"}
+    elif any(k in netloc for k in ["luluvid", "byseqekaho", "playmogo"]):
+        return {"category": "video", "name": "Luluvid", "desc": "Luluvid 视频流 (支持网页在线原画点播)"}
+    elif "filemoon" in netloc:
+        return {"category": "video", "name": "Filemoon", "desc": "Filemoon 视频主机 (支持网页在线播放与嗅探下载)"}
+    elif any(k in netloc for k in ["tubeload", "redload"]):
+        return {"category": "video", "name": "TubeLoad", "desc": "TubeLoad 视频主机 (支持在线流播放与直接下载)"}
+    elif any(k in netloc for k in ["mxdrop", "mixdrop"]):
+        return {"category": "video", "name": "MixDrop", "desc": "Mixdrop 视频网盘 (支持在线播放与下载)"}
+    elif "myvidplay" in netloc:
+        return {"category": "video", "name": "MyVidPlay", "desc": "MyVidPlay 视频流"}
+    elif any(k in netloc for k in ["dood", "ds2video"]):
+        return {"category": "video", "name": "DoodStream", "desc": "DoodStream 视频平台"}
+    elif "ninjastream" in netloc:
+        return {"category": "video", "name": "NinjaStream", "desc": "NinjaStream 视频流"}
+    elif "upvideo" in netloc:
+        return {"category": "video", "name": "UpVideo", "desc": "UpVideo 视频流"}
+    elif "videobin" in netloc:
+        return {"category": "video", "name": "VideoBin", "desc": "VideoBin 视频流"}
+
+    return {"category": "other", "name": netloc or "外部资源", "desc": "第三方外部链接"}
 
 
 def sanitize_filename(name: str, max_length: int = 80) -> str:
@@ -126,6 +179,194 @@ class StorageManager:
 
         logger.info(f"已保存 {len(records)} 条数据到 CSV: {file_path}")
         return file_path
+
+    def save_links_guide(self, post_data: Dict[str, Any], target_dir: Optional[Path] = None) -> Path:
+        """
+        生成并保存该文章所有网盘下载链接与视频直链的专属本地指南文件
+        """
+        title = post_data.get("title", "未命名文章")
+        safe_name = sanitize_filename(title, max_length=60)
+
+        if target_dir is None:
+            c_type = post_data.get("content_type", "")
+            if c_type == "video" or "視頻" in str(post_data.get("series") or "") or "视频" in str(post_data.get("series") or ""):
+                target_dir = self.videos_dir / safe_name
+            elif c_type == "photo" or "寫真" in str(post_data.get("series") or "") or "写真" in str(post_data.get("series") or ""):
+                target_dir = self.images_dir / safe_name
+            else:
+                target_dir = self.data_dir / "links"
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        file_path = target_dir / f"【下载链接与网盘汇总】_{safe_name}.txt"
+
+        url = post_data.get("url", "")
+        date = post_data.get("date", "-")
+        series = post_data.get("series", "")
+        if isinstance(series, list):
+            series = ", ".join(series)
+
+        download_links = post_data.get("download_links", [])
+        video_links = post_data.get("video_links", [])
+
+        if isinstance(download_links, str):
+            try:
+                download_links = json.loads(download_links)
+            except Exception:
+                download_links = []
+        if isinstance(video_links, str):
+            try:
+                video_links = json.loads(video_links)
+            except Exception:
+                video_links = []
+
+        lines = [
+            "=" * 80,
+            f"【资源名称】: {title}",
+            f"【所属板块】: {series or '综合'}",
+            f"【发布日期】: {date}",
+            f"【原站链接】: {url}",
+            "=" * 80,
+            "",
+        ]
+
+        clouds = []
+        for it in download_links:
+            u = it.get("url") if isinstance(it, dict) else str(it)
+            txt = it.get("text", "") if isinstance(it, dict) else ""
+            if u:
+                info = identify_link_platform(u)
+                clouds.append((info, u, txt))
+
+        if clouds:
+            lines.append("【一、网盘高速下载链接】(打包文件 / 原画原图)")
+            lines.append("-" * 80)
+            for idx, (info, u, txt) in enumerate(clouds, 1):
+                extra = f" ({txt})" if txt and txt != u else ""
+                lines.append(f"  [{idx}] 【{info['name']}】{extra}")
+                lines.append(f"      下载地址: {u}")
+                lines.append(f"      平台说明: {info['desc']}")
+                lines.append("")
+            lines.append("")
+
+        videos = []
+        for it in video_links:
+            u = it.get("url") if isinstance(it, dict) else str(it)
+            txt = it.get("text", "") if isinstance(it, dict) else ""
+            if u:
+                info = identify_link_platform(u)
+                videos.append((info, u, txt))
+
+        if videos:
+            lines.append("【二、视频在线播放与真实文件源】(在线秒播 / 单独 MP4 下载)")
+            lines.append("-" * 80)
+            for idx, (info, u, txt) in enumerate(videos, 1):
+                extra = f" ({txt})" if txt and txt != u else ""
+                lines.append(f"  [{idx}] 【{info['name']}】{extra}")
+                lines.append(f"      视频地址: {u}")
+                lines.append(f"      操作建议: {info['desc']}")
+                lines.append("")
+            lines.append("")
+
+        if not clouds and not videos:
+            lines.append("【提示】: 该文章在原网站未提取到外部网盘或视频播放外链（部分历史老帖资源可能已下架失效）。")
+            lines.append(f"您可以访问原站网页确认最新状态: {url}")
+            lines.append("")
+
+        lines.extend([
+            "【三、第三方极速下载使用技巧】",
+            "-" * 80,
+            "  1. [针对 Streamtape 视频主机]:",
+            "     * 方法 A (强烈推荐): 使用安装了 IDM (Internet Download Manager) 或 FDM 的浏览器打开，页面浮窗即可一键抓取原画 MP4。",
+            "     * 方法 B: 使用安装了广告拦截插件 (如 uBlock Origin) 的浏览器直接访问，视频下方提供原生的 'Download Video' 按钮。",
+            "     * 方法 C: 配合油猴脚本 (Tampermonkey) 安装 'Streamtape Downloader'，可秒解析直链高速下载。",
+            "  2. [针对 Google Drive / MEGA / TeraBox 网盘]:",
+            "     * 直接在浏览器打开即可转存至个人网盘或不限速打包下载。",
+            "  3. [针对 VOE / Luluvid 视频流]:",
+            "     * 爬虫内置支持直接解析；如遇网络风控，在浏览器中打开链接即可原画流畅播放。",
+            "=" * 80,
+        ])
+
+        content = "\n".join(lines)
+        file_path.write_text(content, encoding="utf-8")
+        logger.info(f"已生成下载指南文件: {file_path}")
+        return file_path
+
+    def export_links_catalog(self, records: List[Dict[str, Any]], filename_prefix: str = "links_catalog") -> Dict[str, str]:
+        """批量导出所选文章的所有网盘下载链接与视频播放直链汇总"""
+        txt_path = self.data_dir / f"{filename_prefix}.txt"
+        csv_path = self.data_dir / f"{filename_prefix}.csv"
+
+        txt_lines = [
+            "=" * 80,
+            f"wyblogs 爬虫 - 网盘下载链接与视频播放直链批量汇总清单",
+            f"导出条目总数: {len(records)} 篇",
+            "=" * 80,
+            ""
+        ]
+
+        csv_rows = []
+
+        for idx, r in enumerate(records, 1):
+            title = r.get("title", "无标题")
+            series = r.get("series", "")
+            if isinstance(series, list):
+                series = ", ".join(series)
+            date = r.get("date", "-")
+            post_url = r.get("url", "")
+
+            d_links = r.get("download_links", [])
+            v_links = r.get("video_links", [])
+            if isinstance(d_links, str):
+                try: d_links = json.loads(d_links)
+                except Exception: d_links = []
+            if isinstance(v_links, str):
+                try: v_links = json.loads(v_links)
+                except Exception: v_links = []
+
+            txt_lines.append(f"[{idx:03d}] {title} (板块: {series} | 日期: {date})")
+            txt_lines.append(f"      原文地址: {post_url}")
+
+            if d_links:
+                txt_lines.append("      [网盘下载链接]:")
+                for d in d_links:
+                    u = d.get("url") if isinstance(d, dict) else str(d)
+                    info = identify_link_platform(u)
+                    txt_lines.append(f"        * 【{info['name']}】: {u}")
+                    csv_rows.append({
+                        "序号": idx, "文章标题": title, "板块": series, "发布日期": date,
+                        "链接类型": "网盘", "平台": info["name"], "下载地址": u,
+                        "原文网址": post_url, "建议": info["desc"]
+                    })
+
+            if v_links:
+                txt_lines.append("      [视频播放与直链]:")
+                for v in v_links:
+                    u = v.get("url") if isinstance(v, dict) else str(v)
+                    info = identify_link_platform(u)
+                    txt_lines.append(f"        * 【{info['name']}】: {u}")
+                    csv_rows.append({
+                        "序号": idx, "文章标题": title, "板块": series, "发布日期": date,
+                        "链接类型": "视频", "平台": info["name"], "下载地址": u,
+                        "原文网址": post_url, "建议": info["desc"]
+                    })
+
+            if not d_links and not v_links:
+                txt_lines.append("      (暂未提取到外部网盘或视频直链)")
+
+            txt_lines.append("-" * 80)
+
+        txt_path.write_text("\n".join(txt_lines), encoding="utf-8")
+
+        fieldnames = ["序号", "文章标题", "板块", "发布日期", "链接类型", "平台", "下载地址", "原文网址", "建议"]
+        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+        return {
+            "txt": str(txt_path),
+            "csv": str(csv_path)
+        }
 
     def download_post_images(self, post_data: Dict[str, Any], session: requests.Session) -> int:
         """

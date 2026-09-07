@@ -289,12 +289,18 @@ def interactive_search(
             for sp in selected_posts
         )
         if not download_vid and has_video:
-            download_vid = confirm_choice("检测到选中内容包含视频板块，是否自动解析并下载真实 MP4 视频到本地？", default=True)
+            download_vid = confirm_choice("检测到选中内容包含视频板块，是否尝试解析下载真实 MP4 视频？(注: 无论是否成功均会自动生成网盘与直链下载指南)", default=True)
 
         urls = [item["url"] for item in selected_posts]
         crawled = crawler.crawl_posts_by_urls(urls, download_images=download_img, download_videos=download_vid)
         files = crawler.export(filename_prefix=f"wyblogs_search_{sanitize_filename(keyword)}", records=crawled)
-        
+
+        links_txt = None
+        if has_video or any(p.get("download_links") or p.get("video_links") for p in crawled):
+            links_files = crawler.export_links_catalog(crawled, filename_prefix=f"wyblogs_links_{sanitize_filename(keyword)}")
+            links_txt = links_files["txt"]
+            print_success(f"网盘与视频直链清单已批量汇总导出至: {links_txt}")
+
         render_summary_panel("指定下载任务已完成", {
             "搜索关键词": keyword,
             "下载文章数": len(selected_posts),
@@ -302,7 +308,8 @@ def interactive_search(
             "元数据 CSV": files["csv"],
             "小说目录": crawler.storage.novels_dir,
             "图片目录": crawler.storage.images_dir if download_img else None,
-            "视频目录": crawler.videos_dir if download_vid else None
+            "视频目录": crawler.videos_dir if download_vid else None,
+            "直链与网盘清单": links_txt
         })
         return
 
@@ -435,7 +442,7 @@ def interactive_local_search(crawler: WyblogsCrawler):
 
         download_vid = False
         if has_video:
-            download_vid = confirm_choice("检测到包含视频外链，是否立即调取直链下载真实 MP4 视频？", default=True)
+            download_vid = confirm_choice("检测到包含视频外链，是否尝试调取直链下载真实 MP4 视频？(注: 无论是否成功均会自动生成网盘与直链下载指南)", default=True)
 
         # 执行下载：直接从本地数据调取，无需请求网页！
         print_info("正在从本地数据库调取链接执行下载，无需请求目标网页...")
@@ -447,11 +454,18 @@ def interactive_local_search(crawler: WyblogsCrawler):
                 save_novel_txt=download_txt,
             )
 
+        links_txt = None
+        if has_video or any(sp.get("download_links") or sp.get("video_links") for sp in selected_posts):
+            links_files = crawler.export_links_catalog(selected_posts, filename_prefix="local_selected_links")
+            links_txt = links_files["txt"]
+            print_success(f"所选文章的网盘与视频直链清单已批量汇总导出至: {links_txt}")
+
         render_summary_panel("本地自选下载任务完成", {
             "处理篇数": len(selected_posts),
             "小说目录": crawler.storage.novels_dir if download_txt else None,
             "图片目录": crawler.storage.images_dir if download_img else None,
-            "视频目录": crawler.videos_dir if download_vid else None
+            "视频目录": crawler.videos_dir if download_vid else None,
+            "直链与网盘清单": links_txt
         })
         return
 

@@ -149,6 +149,9 @@ class WyblogsCrawler:
         post_video_dir.mkdir(parents=True, exist_ok=True)
 
         downloaded_files = []
+        # 无论自动转码是否成功，首先提取并保存该视频完整的网盘与播放直链下载指南文件
+        guide_path = self.storage.save_links_guide(data, post_video_dir)
+
         logger.info(f"开始解析并下载 [{title}] 的视频 (共发现 {len(video_links)} 个外链源)...")
 
         parts_handled = set()
@@ -188,7 +191,16 @@ class WyblogsCrawler:
                 downloaded_files.append(target_path)
                 parts_handled.add(part_tag)
 
-        logger.info(f"[{title}] 视频下载流程结束，成功下载 {len(downloaded_files)} 个视频文件。")
+        if not downloaded_files:
+            logger.warning(f"[{title}] 未能直接下载为 MP4 视频文件。")
+            if ui.is_interactive_ui():
+                ui.render_post_links_panel(data, saved_guide_path=guide_path)
+                ui.print_warning(
+                    f"【{title}】未能直接下载为 MP4 文件（受防盗链或主机限制）。\n"
+                    f"已为您完整提取网盘与播放直链至本地指南文件:\n{guide_path}"
+                )
+        else:
+            logger.info(f"[{title}] 视频下载流程结束，成功下载 {len(downloaded_files)} 个视频文件。")
         return downloaded_files
 
     def build_list_page_url(self, series: Optional[str], page: int) -> str:
@@ -551,5 +563,17 @@ class WyblogsCrawler:
         if download_videos and post_data.get("video_links"):
             saved_videos = self.download_post_videos(post_data)
             result["downloaded_videos"] = [str(p) for p in saved_videos]
+        elif post_data.get("video_links") or post_data.get("download_links"):
+            # 如果未开启自动下载视频，仍为用户生成网盘与视频直链下载指南文件
+            guide_path = self.storage.save_links_guide(post_data)
+            result["saved_guide_path"] = str(guide_path)
 
         return result
+
+    def export_links_catalog(
+        self,
+        records: List[Dict[str, Any]],
+        filename_prefix: str = "links_catalog"
+    ) -> Dict[str, str]:
+        """批量导出所选文章的网盘与视频直链清单汇总文件 (TXT与CSV)"""
+        return self.storage.export_links_catalog(records, filename_prefix)
