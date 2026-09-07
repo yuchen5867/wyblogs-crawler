@@ -1,4 +1,5 @@
 import json
+import threading
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ class ArchiveDatabase:
     def __init__(self, db_path: Optional[Path] = None):
         self.db_path = Path(db_path) if db_path else DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_lock = threading.Lock()
         self._init_db()
 
     @contextmanager
@@ -29,6 +31,7 @@ class ArchiveDatabase:
     def _init_db(self):
         """初始化数据表与索引"""
         with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS posts (
@@ -70,66 +73,13 @@ class ArchiveDatabase:
         img_list = json.dumps(data.get("images", []), ensure_ascii=False)
         img_cnt = len(data.get("images", []))
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO posts (
-                    url, title, content_type, date, word_count, reading_time,
-                    series, categories, tags, summary, text,
-                    download_links, video_links, images, images_count, archived_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                ON CONFLICT(url) DO UPDATE SET
-                    title=excluded.title,
-                    content_type=excluded.content_type,
-                    date=excluded.date,
-                    word_count=excluded.word_count,
-                    reading_time=excluded.reading_time,
-                    series=excluded.series,
-                    categories=excluded.categories,
-                    tags=excluded.tags,
-                    summary=excluded.summary,
-                    text=excluded.text,
-                    download_links=excluded.download_links,
-                    video_links=excluded.video_links,
-                    images=excluded.images,
-                    images_count=excluded.images_count,
-                    archived_at=CURRENT_TIMESTAMP;
-            """, (
-                data["url"],
-                data.get("title", ""),
-                data.get("content_type", "article"),
-                data.get("date", ""),
-                data.get("word_count", ""),
-                data.get("reading_time", ""),
-                series_val,
-                cat_val,
-                tags_val,
-                data.get("summary", ""),
-                data.get("text", ""),
-                dl_links,
-                vid_links,
-                img_list,
-                img_cnt
-            ))
-            conn.commit()
-            return True
-
-    def save_posts_batch(self, posts: List[Dict[str, Any]]) -> int:
-        """批量插入或更新归档数据"""
-        saved = 0
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            for p in posts:
-                if not p or not p.get("url"):
-                    continue
-                series_val = "; ".join(p.get("series", [])) if isinstance(p.get("series"), list) else (p.get("series") or "")
-                cat_val = "; ".join(p.get("categories", [])) if isinstance(p.get("categories"), list) else (p.get("categories") or "")
-                tags_val = "; ".join(p.get("tags", [])) if isinstance(p.get("tags"), list) else (p.get("tags") or "")
-                dl_links = json.dumps(p.get("download_links", []), ensure_ascii=False)
-                vid_links = json.dumps(p.get("video_links", []), ensure_ascii=False)
-                img_list = json.dumps(p.get("images", []), ensure_ascii=False)
-                img_cnt = len(p.get("images", []))
-
+        with self._write_lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT text, images, video_links FROM posts WHERE url = ? LIMIT 1;", (data["url"],))
+                existing = cursor.fetchone()
+                if existing and self._is_sparse_post(data) and not self._row_is_sparse(existing):
+                    return False
                 cursor.execute("""
                     INSERT INTO posts (
                         url, title, content_type, date, word_count, reading_time,
@@ -153,24 +103,83 @@ class ArchiveDatabase:
                         images_count=excluded.images_count,
                         archived_at=CURRENT_TIMESTAMP;
                 """, (
-                    p["url"],
-                    p.get("title", ""),
-                    p.get("content_type", "article"),
-                    p.get("date", ""),
-                    p.get("word_count", ""),
-                    p.get("reading_time", ""),
+                    data["url"],
+                    data.get("title", ""),
+                    data.get("content_type", "article"),
+                    data.get("date", ""),
+                    data.get("word_count", ""),
+                    data.get("reading_time", ""),
                     series_val,
                     cat_val,
                     tags_val,
-                    p.get("summary", ""),
-                    p.get("text", ""),
+                    data.get("summary", ""),
+                    data.get("text", ""),
                     dl_links,
                     vid_links,
                     img_list,
                     img_cnt
                 ))
-                saved += 1
-            conn.commit()
+                conn.commit()
+                return True
+
+    def save_posts_batch(self, posts: List[Dict[str, Any]]) -> int:
+        """批量插入或更新归档数据"""
+        saved = 0
+        with self._write_lock:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for p in posts:
+                    if not p or not p.get("url"):
+                        continue
+                    series_val = "; ".join(p.get("series", [])) if isinstance(p.get("series"), list) else (p.get("series") or "")
+                    cat_val = "; ".join(p.get("categories", [])) if isinstance(p.get("categories"), list) else (p.get("categories") or "")
+                    tags_val = "; ".join(p.get("tags", [])) if isinstance(p.get("tags"), list) else (p.get("tags") or "")
+                    dl_links = json.dumps(p.get("download_links", []), ensure_ascii=False)
+                    vid_links = json.dumps(p.get("video_links", []), ensure_ascii=False)
+                    img_list = json.dumps(p.get("images", []), ensure_ascii=False)
+                    img_cnt = len(p.get("images", []))
+
+                    cursor.execute("""
+                        INSERT INTO posts (
+                            url, title, content_type, date, word_count, reading_time,
+                            series, categories, tags, summary, text,
+                            download_links, video_links, images, images_count, archived_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(url) DO UPDATE SET
+                            title=excluded.title,
+                            content_type=excluded.content_type,
+                            date=excluded.date,
+                            word_count=excluded.word_count,
+                            reading_time=excluded.reading_time,
+                            series=excluded.series,
+                            categories=excluded.categories,
+                            tags=excluded.tags,
+                            summary=excluded.summary,
+                            text=excluded.text,
+                            download_links=excluded.download_links,
+                            video_links=excluded.video_links,
+                            images=excluded.images,
+                            images_count=excluded.images_count,
+                            archived_at=CURRENT_TIMESTAMP;
+                    """, (
+                        p["url"],
+                        p.get("title", ""),
+                        p.get("content_type", "article"),
+                        p.get("date", ""),
+                        p.get("word_count", ""),
+                        p.get("reading_time", ""),
+                        series_val,
+                        cat_val,
+                        tags_val,
+                        p.get("summary", ""),
+                        p.get("text", ""),
+                        dl_links,
+                        vid_links,
+                        img_list,
+                        img_cnt
+                    ))
+                    saved += 1
+                conn.commit()
         return saved
 
     def has_post(self, url: str) -> bool:
@@ -223,17 +232,19 @@ class ArchiveDatabase:
         params = []
 
         if keyword:
-            pattern = f"%{keyword}%"
+            pattern = f"%{self._like_escape(keyword)}%"
             if search_scope == "title":
-                conditions.append("title LIKE ?")
+                conditions.append("title LIKE ? ESCAPE '\\'")
                 params.append(pattern)
             else:
-                conditions.append("(title LIKE ? OR text LIKE ? OR summary LIKE ?)")
+                conditions.append(
+                    "(title LIKE ? ESCAPE '\\' OR text LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\')"
+                )
                 params.extend([pattern, pattern, pattern])
 
         if series_filter:
-            s_pat = f"%{series_filter}%"
-            conditions.append("(series LIKE ? OR categories LIKE ?)")
+            s_pat = f"%{self._like_escape(series_filter)}%"
+            conditions.append("(series LIKE ? ESCAPE '\\' OR categories LIKE ? ESCAPE '\\')")
             params.extend([s_pat, s_pat])
 
         where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
@@ -258,7 +269,7 @@ class ArchiveDatabase:
             cursor.execute("SELECT COUNT(*) FROM posts WHERE series LIKE '%小說%' OR content_type = 'novel';")
             novels = cursor.fetchone()[0]
 
-            cursor.execute("SELECT COUNT(*) FROM posts WHERE series LIKE '%寫真%' OR images_count > 0;")
+            cursor.execute("SELECT COUNT(*) FROM posts WHERE series LIKE '%寫真%' OR content_type = 'photo';")
             photos = cursor.fetchone()[0]
 
             cursor.execute("SELECT COUNT(*) FROM posts WHERE series LIKE '%視頻%' OR video_links != '[]';")
@@ -278,6 +289,26 @@ class ArchiveDatabase:
                 "haitang_count": haitang,
                 "db_size_mb": round(db_size_mb, 2)
             }
+
+    @staticmethod
+    def _like_escape(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @staticmethod
+    def _is_sparse_post(data: Dict[str, Any]) -> bool:
+        text = (data.get("text") or "").strip()
+        images = data.get("images") or []
+        videos = data.get("video_links") or []
+        return not text and not images and not videos
+
+    @staticmethod
+    def _row_is_sparse(row: sqlite3.Row) -> bool:
+        text = (row["text"] or "").strip() if "text" in row.keys() else ""
+        images = row["images"] if "images" in row.keys() else "[]"
+        videos = row["video_links"] if "video_links" in row.keys() else "[]"
+        has_images = bool(images) and images not in ("[]", "null")
+        has_videos = bool(videos) and videos not in ("[]", "null")
+        return not text and not has_images and not has_videos
 
     def _row_to_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         """将数据库 Row 转换为统一的文章字典格式"""

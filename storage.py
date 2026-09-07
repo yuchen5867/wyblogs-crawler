@@ -13,16 +13,24 @@ import ui
 
 logger = logging.getLogger("wyblogs_spider")
 
+_WIN_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
 def sanitize_filename(name: str, max_length: int = 80) -> str:
     """清理文件名中的非法字符（适配 Windows/Linux）"""
-    # 替换 Windows 常见非法字符: \ / : * ? " < > |
     sanitized = re.sub(r'[\\/*?:"<>|]', '_', name)
-    # 替换控制字符与多余空格
     sanitized = re.sub(r'[\r\n\t]+', ' ', sanitized)
     sanitized = re.sub(r'\s+', ' ', sanitized).strip()
-    # 限制长度
+    sanitized = sanitized.rstrip(" .")
     if len(sanitized) > max_length:
-        sanitized = sanitized[:max_length].strip()
+        sanitized = sanitized[:max_length].rstrip(" .")
+    stem = sanitized.split(".")[0].upper() if sanitized else ""
+    if not sanitized or sanitized.upper() in _WIN_RESERVED or stem in _WIN_RESERVED:
+        sanitized = f"_{sanitized}" if sanitized else "untitled"
     return sanitized or "untitled"
 
 class StorageManager:
@@ -30,11 +38,13 @@ class StorageManager:
         self.output_dir = Path(output_dir)
         self.novels_dir = self.output_dir / "novels"
         self.images_dir = self.output_dir / "images"
+        self.videos_dir = self.output_dir / "videos"
         self.data_dir = self.output_dir / "data"
 
         # 确保目录存在
         self.novels_dir.mkdir(parents=True, exist_ok=True)
         self.images_dir.mkdir(parents=True, exist_ok=True)
+        self.videos_dir.mkdir(parents=True, exist_ok=True)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.history_manager = SearchHistoryManager(self.output_dir / ".search_history.json")
 
@@ -52,9 +62,9 @@ class StorageManager:
             f"发布时间: {post_data.get('date', '未知')}",
             f"文章字数: {post_data.get('word_count', '未知')}",
             f"预计阅读: {post_data.get('reading_time', '未知')}",
-            f"系列板块: {', '.join(post_data.get('series', []))}",
-            f"所属分类: {', '.join(post_data.get('categories', []))}",
-            f"标签列表: {', '.join(post_data.get('tags', []))}",
+            f"系列板块: {', '.join(post_data.get('series', [])) if isinstance(post_data.get('series'), list) else (post_data.get('series') or '')}",
+            f"所属分类: {', '.join(post_data.get('categories', [])) if isinstance(post_data.get('categories'), list) else (post_data.get('categories') or '')}",
+            f"标签列表: {', '.join(post_data.get('tags', [])) if isinstance(post_data.get('tags'), list) else (post_data.get('tags') or '')}",
             f"原文链接: {post_data.get('url', '')}",
             "=" * 70,
             "",
@@ -75,9 +85,6 @@ class StorageManager:
         serializable = []
         for r in records:
             item = dict(r)
-            if "text" in item and len(item["text"]) > 1000:
-                item["text_snippet"] = item["text"][:300] + "..."
-                # 保留 text
             serializable.append(item)
 
         with open(file_path, "w", encoding="utf-8") as f:
@@ -91,9 +98,6 @@ class StorageManager:
         导出条目元数据为 CSV 文件
         """
         file_path = self.data_dir / filename
-        if not records:
-            return file_path
-
         fieldnames = [
             "title", "content_type", "date", "word_count", "reading_time",
             "series", "categories", "tags", "url",
@@ -110,9 +114,9 @@ class StorageManager:
                     "date": r.get("date", ""),
                     "word_count": r.get("word_count", ""),
                     "reading_time": r.get("reading_time", ""),
-                    "series": "; ".join(r.get("series", [])),
-                    "categories": "; ".join(r.get("categories", [])),
-                    "tags": "; ".join(r.get("tags", [])),
+                    "series": "; ".join(r.get("series", [])) if isinstance(r.get("series"), list) else (r.get("series") or ""),
+                    "categories": "; ".join(r.get("categories", [])) if isinstance(r.get("categories"), list) else (r.get("categories") or ""),
+                    "tags": "; ".join(r.get("tags", [])) if isinstance(r.get("tags"), list) else (r.get("tags") or ""),
                     "url": r.get("url", ""),
                     "download_links": "\n".join([f"{d.get('text', '')}: {d.get('url', '')}" for d in r.get("download_links", [])]),
                     "video_links": "\n".join([f"{v.get('text', '')}: {v.get('url', '')}" for v in r.get("video_links", [])]),
@@ -139,41 +143,50 @@ class StorageManager:
         downloaded_count = 0
         total = len(images)
         disp_title = title if len(title) <= 22 else title[:19] + "..."
+        show_progress = ui.is_interactive_ui()
+        progress_cm = ui.create_counter_progress(unit="张") if show_progress else None
 
-        with ui.create_counter_progress(unit="张") as progress:
-            task_id = progress.add_task(f"下载图集: {disp_title}", total=total)
+        def _one(idx, img_info):
+            nonlocal downloaded_count
+            img_url = img_info["url"]
+            ext = ".jpg"
+            lower_url = img_url.lower()
+            if ".png" in lower_url:
+                ext = ".png"
+            elif ".webp" in lower_url:
+                ext = ".webp"
+            elif ".gif" in lower_url:
+                ext = ".gif"
 
-            for idx, img_info in enumerate(images, 1):
-                img_url = img_info["url"]
-                ext = ".jpg"
-                if ".png" in img_url.lower():
-                    ext = ".png"
-                elif ".webp" in img_url.lower():
-                    ext = ".webp"
-                elif ".gif" in img_url.lower():
-                    ext = ".gif"
-
-                img_file = post_img_dir / f"{idx:03d}{ext}"
-                if img_file.exists() and img_file.stat().st_size > 0:
+            img_file = post_img_dir / f"{idx:03d}{ext}"
+            if img_file.exists() and img_file.stat().st_size > 0:
+                downloaded_count += 1
+                return
+            try:
+                headers = {"Referer": post_data.get("url", "")}
+                resp = session.get(img_url, headers=headers, timeout=15)
+                if resp.status_code == 200:
+                    img_file.write_bytes(resp.content)
                     downloaded_count += 1
+                else:
+                    logger.warning(f"图片下载返回状态码 {resp.status_code}: {img_url}")
+            except Exception as e:
+                logger.warning(f"图片下载失败 {img_url}: {e}")
+
+        if progress_cm is not None:
+            with progress_cm as progress:
+                task_id = progress.add_task(f"下载图集: {disp_title}", total=total)
+                for idx, img_info in enumerate(images, 1):
+                    _one(idx, img_info)
                     progress.update(task_id, advance=1)
-                    continue
+        else:
+            for idx, img_info in enumerate(images, 1):
+                _one(idx, img_info)
 
-                try:
-                    # 附带 Referer 防盗链
-                    headers = {"Referer": post_data.get("url", "")}
-                    resp = session.get(img_url, headers=headers, timeout=15)
-                    if resp.status_code == 200:
-                        img_file.write_bytes(resp.content)
-                        downloaded_count += 1
-                    else:
-                        logger.warning(f"图片下载返回状态码 {resp.status_code}: {img_url}")
-                except Exception as e:
-                    logger.warning(f"图片下载失败 {img_url}: {e}")
-                
-                progress.update(task_id, advance=1)
-
-        ui.print_success(f"[{title}] 写真套图下载完成: 成功 {downloaded_count}/{total} 张")
+        if show_progress:
+            ui.print_success(f"[{title}] 写真套图下载完成: 成功 {downloaded_count}/{total} 张")
+        else:
+            logger.info(f"[{title}] 写真套图下载完成: 成功 {downloaded_count}/{total} 张")
         return downloaded_count
 
     def save_search_list_to_csv(self, search_results: List[Dict[str, Any]], filename: str = "search_results.csv") -> Path:
@@ -187,15 +200,30 @@ class StorageManager:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for idx, item in enumerate(search_results, 1):
-                raw_content = item.get("content", "").replace("\r", " ").replace("\n", " ").strip()
+                raw_content = (
+                    item.get("content")
+                    or item.get("text")
+                    or item.get("summary")
+                    or ""
+                )
+                raw_content = str(raw_content).replace("\r", " ").replace("\n", " ").strip()
                 snippet = raw_content[:150] + ("..." if len(raw_content) > 150 else "")
+                cats = item.get("categorys") or item.get("categories") or ""
+                if isinstance(cats, list):
+                    cats = "; ".join(str(c) for c in cats)
+                tags = item.get("tags") or ""
+                if isinstance(tags, list):
+                    tags = "; ".join(str(t) for t in tags)
+                series = item.get("series") or ""
+                if isinstance(series, list):
+                    series = "; ".join(str(s) for s in series)
                 writer.writerow({
                     "index": idx,
                     "title": item.get("title", ""),
                     "date": item.get("date", ""),
-                    "series": item.get("series", ""),
-                    "categorys": item.get("categorys", ""),
-                    "tags": item.get("tags", ""),
+                    "series": series,
+                    "categorys": cats,
+                    "tags": tags,
                     "url": item.get("url", item.get("permalink", "")),
                     "snippet": snippet
                 })

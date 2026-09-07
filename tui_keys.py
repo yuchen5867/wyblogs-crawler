@@ -53,25 +53,44 @@ def get_key() -> str:
         # Unix / Linux / macOS fallback
         import tty
         import termios
+        import select as select_mod
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         try:
             tty.setraw(fd)
             ch = sys.stdin.read(1)
             if ch == '\x1b':
-                # Escape sequence
+                # 单独 ESC：短超时内没有后续字节则立即返回，避免阻塞
+                ready, _, _ = select_mod.select([sys.stdin], [], [], 0.05)
+                if not ready:
+                    return 'ESC'
                 ch2 = sys.stdin.read(1)
                 if ch2 == '[':
                     ch3 = sys.stdin.read(1)
-                    seq_map = {
+                    arrow_map = {
                         'A': 'UP',
                         'B': 'DOWN',
                         'C': 'RIGHT',
                         'D': 'LEFT',
-                        '5': 'PAGE_UP',
-                        '6': 'PAGE_DOWN'
+                        'H': 'HOME',
+                        'F': 'END',
                     }
-                    return seq_map.get(ch3, 'ESC')
+                    if ch3 in arrow_map:
+                        return arrow_map[ch3]
+                    if ch3.isdigit():
+                        extra = sys.stdin.read(1)
+                        if extra != '~' and extra:
+                            # 消耗 ESC [ 1 ; N X 这类修饰键序列的剩余字节
+                            pass
+                        ext_map = {
+                            '1': 'HOME',
+                            '3': 'DELETE',
+                            '4': 'END',
+                            '5': 'PAGE_UP',
+                            '6': 'PAGE_DOWN',
+                        }
+                        return ext_map.get(ch3, 'ESC')
+                    return 'ESC'
                 return 'ESC'
             elif ch in ('\r', '\n'):
                 return 'ENTER'

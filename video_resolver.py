@@ -78,7 +78,7 @@ class VoeResolver:
         6. 字符串倒序 (reverse)
         7. 最终 Base64 解码并输出 JSON 数据
         """
-        soup = BeautifulSoup(html_text, "html.parser")
+        soup = BeautifulSoup(html_text, "lxml")
         target_str = None
         for s in soup.find_all("script"):
             txt = s.get_text(strip=True)
@@ -171,7 +171,7 @@ class VoeResolver:
             headers["Referer"] = target_url
             dl_resp = session.get(download_page_url, headers=headers, timeout=TIMEOUT)
             if dl_resp.status_code == 200:
-                soup = BeautifulSoup(dl_resp.text, "html.parser")
+                soup = BeautifulSoup(dl_resp.text, "lxml")
                 for a in soup.find_all("a", href=True):
                     href = a["href"]
                     if any(ext in href for ext in [".mp4", "cloudwindow-route.com", "orbitcache.com"]):
@@ -263,15 +263,34 @@ class PixeldrainResolver:
             }
         return None
 
+_PLAYWRIGHT_AVAILABLE = None
+_PLAYWRIGHT_MISSING_LOGGED = False
+
+
+def _playwright_available() -> bool:
+    global _PLAYWRIGHT_AVAILABLE, _PLAYWRIGHT_MISSING_LOGGED
+    if _PLAYWRIGHT_AVAILABLE is None:
+        try:
+            from playwright.sync_api import sync_playwright  # noqa: F401
+            _PLAYWRIGHT_AVAILABLE = True
+        except ImportError:
+            _PLAYWRIGHT_AVAILABLE = False
+    if not _PLAYWRIGHT_AVAILABLE and not _PLAYWRIGHT_MISSING_LOGGED:
+        logger.info("未安装 playwright，跳过浏览器嗅探兜底")
+        _PLAYWRIGHT_MISSING_LOGGED = True
+    return bool(_PLAYWRIGHT_AVAILABLE)
+
+
 # ─────────────────────────── Playwright 嗅探降级 ───────────────────────────
 class PlaywrightFallbackSniffer:
     """Playwright 浏览器自动化嗅探器（针对复杂防御平台的通用兜底）"""
     @staticmethod
     def sniff(url: str) -> Optional[Dict[str, Any]]:
+        if not _playwright_available():
+            return None
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            logger.warning("未安装 playwright，跳过浏览器嗅探")
             return None
 
         ad_domains = [
@@ -351,9 +370,24 @@ class VideoDownloader:
     """
     负责识别外链、解析真实数据流、执行流式拉取或 FFmpeg 合成
     """
-    def __init__(self, session: Optional[requests.Session] = None):
-        self.session = session or requests.Session()
+    def __init__(
+        self,
+        session: Optional[requests.Session] = None,
+        session_factory=None,
+    ):
+        self._session = session
+        self._session_factory = session_factory
+        if self._session is None and self._session_factory is None:
+            self._session = requests.Session()
         self.ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+
+    @property
+    def session(self) -> requests.Session:
+        if self._session_factory:
+            return self._session_factory()
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
 
     def resolve_stream(self, video_url: str) -> Optional[Dict[str, Any]]:
         """智能路由解析视频流，集成动态转圈加载动画"""
@@ -380,7 +414,9 @@ class VideoDownloader:
                     ui.print_success("Pixeldrain 直链转换成功")
                     return res
 
-        # 尝试使用 Playwright 嗅探兜底
+        if not _playwright_available():
+            return None
+
         with ui.show_status(f"启用无头浏览器嗅探媒体流: {short_url}"):
             res = PlaywrightFallbackSniffer.sniff(video_url)
             if res:
@@ -413,13 +449,21 @@ class VideoDownloader:
                     total_size = int(r.headers.get("content-length", 0))
                     disp_name = output_file.name if len(output_file.name) <= 24 else output_file.name[:21] + "..."
 
-                    with ui.create_download_progress() as progress:
-                        task_id = progress.add_task(f"下载: {disp_name}", total=total_size if total_size > 0 else None)
-                        with open(part_file, "wb") as f:
+                    with open(part_file, "wb") as f:
+                        if ui.is_interactive_ui():
+                            with ui.create_download_progress() as progress:
+                                task_id = progress.add_task(
+                                    f"下载: {disp_name}",
+                                    total=total_size if total_size > 0 else None
+                                )
+                                for chunk in r.iter_content(chunk_size=1024 * 512):
+                                    if chunk:
+                                        f.write(chunk)
+                                        progress.update(task_id, advance=len(chunk))
+                        else:
                             for chunk in r.iter_content(chunk_size=1024 * 512):
                                 if chunk:
                                     f.write(chunk)
-                                    progress.update(task_id, advance=len(chunk))
 
                 if part_file.exists() and part_file.stat().st_size > 1024:
                     if output_file.exists():
@@ -446,21 +490,35 @@ class VideoDownloader:
             referer = headers.get("Referer", "https://wyblogs.eu.org/")
             ua = headers.get("User-Agent", DEFAULT_HEADERS["User-Agent"])
 
-            cmd = [
+            base_cmd = [
                 self.ffmpeg_exe, "-y",
                 "-user_agent", ua,
                 "-headers", f"Referer: {referer}\r\n",
                 "-i", stream_url,
                 "-c", "copy",
-                "-bsf:a", "aac_adtstoasc",
-                str(part_file)
             ]
+            cmd_with_bsf = base_cmd + ["-bsf:a", "aac_adtstoasc", str(part_file)]
+            cmd_plain = base_cmd + [str(part_file)]
+
+            def _run_ffmpeg(cmd):
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=1800,
+                )
 
             try:
                 with ui.show_status(f"FFmpeg 正在合并转码 [{label}]，请稍候..."):
-                    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                
-                if proc.returncode == 0 and part_file.exists() and part_file.stat().st_size > 1024:
+                    proc = _run_ffmpeg(cmd_with_bsf)
+                    ok = proc.returncode == 0 and part_file.exists() and part_file.stat().st_size > 1024
+                    if not ok:
+                        proc = _run_ffmpeg(cmd_plain)
+                        ok = proc.returncode == 0 and part_file.exists() and part_file.stat().st_size > 1024
+
+                if ok:
                     if output_file.exists():
                         output_file.unlink()
                     part_file.rename(output_file)
@@ -468,7 +526,8 @@ class VideoDownloader:
                     ui.print_success(f"[{label}] HLS 视频切片合并完成！大小: {total_mb:.2f} MB")
                     return True
                 else:
-                    ui.print_warning(f"FFmpeg 转码失败: code={proc.returncode}, stderr tail:\n{proc.stderr[-500:]}")
+                    err_tail = (proc.stderr or "")[-500:]
+                    ui.print_warning(f"FFmpeg 转码失败: code={proc.returncode}, stderr tail:\n{err_tail}")
                     if part_file.exists():
                         part_file.unlink()
                     return False

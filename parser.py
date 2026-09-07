@@ -15,7 +15,7 @@ class WyblogsParser:
         解析文章列表页
         返回: {'posts': [...], 'max_page': int, 'has_next': bool}
         """
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         posts = []
 
         articles = soup.find_all("article", class_=lambda c: c and "post" in c.split())
@@ -61,6 +61,15 @@ class WyblogsParser:
             if summary_div:
                 summary = summary_div.get_text(strip=True)
 
+            known_series = ("小說", "寫真", "視頻", "海棠", "耽美辣文", "CG", "歐美視頻")
+            series_val = ""
+            for t in taxonomies:
+                if any(k in t for k in known_series):
+                    series_val = t
+                    break
+            if not series_val and taxonomies:
+                series_val = taxonomies[0]
+
             posts.append({
                 "title": title,
                 "url": full_url,
@@ -68,6 +77,7 @@ class WyblogsParser:
                 "word_count": word_count,
                 "reading_time": reading_time,
                 "taxonomies": taxonomies,
+                "series": series_val,
                 "summary": summary
             })
 
@@ -99,7 +109,7 @@ class WyblogsParser:
         """
         解析文章/小说/写真/视频详情页
         """
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "lxml")
         article = soup.find("article", class_=lambda c: c and "post" in c.split()) or soup
 
         # 1. 标题
@@ -152,7 +162,7 @@ class WyblogsParser:
             content_div = article
 
         # 创建副本避免破坏原始节点
-        content_copy = BeautifulSoup(str(content_div), "html.parser")
+        content_copy = BeautifulSoup(str(content_div), "lxml")
 
         # 4. 提取外部资源：网盘下载、在线视频、第三方跳转
         download_links = []
@@ -176,8 +186,10 @@ class WyblogsParser:
             lower_text = link_text.lower()
 
             is_video = any(h in lower_href for h in [
-                "luluvid.", "voe.sx", "playmogo.", "byseqekaho.", "stream", "video", ".mp4", ".m3u8"
-            ]) or "video" in lower_text or "視頻" in lower_text or "视频" in lower_text
+                "luluvid.", "luluvdo.", "lulustream.", "voe.sx", "playmogo.", "byseqekaho.",
+                "pixeldrain.", "eugenemakedraw.com", "jonathansociallike.com",
+                "johnalwayssame.com", "diananatureforeign.com", ".m3u8"
+            ]) or lower_href.endswith(".mp4") or "視頻" in lower_text or "视频" in lower_text
 
             is_download = any(h in lower_href for h in [
                 "terabox.", "krakenfiles.", "pixeldrain.", "files.fm", "drive.google.",
@@ -238,14 +250,19 @@ class WyblogsParser:
 
         cleaned_text = "\n".join(cleaned_lines).strip()
 
-        # 7. 判断内容类型
-        content_type = "unknown"
-        if any(s in series_list for s in ["小說", "海棠", "耽美辣文"]) or (len(cleaned_text) > 1000 and len(images) < 10):
-            content_type = "novel"
-        elif any(s in series_list for s in ["寫真", "模特", "CG"]) or len(images) > 5:
-            content_type = "photo"
-        elif any(s in series_list for s in ["視頻", "歐美視頻", "West Gay Video"]) or len(video_links) > 0:
+        # 7. 判断内容类型：先看专区，再看视频/图片资源，正文长度仅作兜底
+        if any(s in series_list for s in ["視頻", "歐美視頻", "West Gay Video"]):
             content_type = "video"
+        elif any(s in series_list for s in ["寫真", "模特", "CG"]):
+            content_type = "photo"
+        elif any(s in series_list for s in ["小說", "海棠", "耽美辣文"]):
+            content_type = "novel"
+        elif video_links:
+            content_type = "video"
+        elif len(images) > 5:
+            content_type = "photo"
+        elif len(cleaned_text) > 1000 and len(images) < 10:
+            content_type = "novel"
         else:
             content_type = "general"
 

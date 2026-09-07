@@ -2,6 +2,7 @@
 wyblogs 爬虫核心引擎
 """
 import time
+import threading
 import logging
 import urllib.parse
 from pathlib import Path
@@ -36,11 +37,23 @@ class WyblogsCrawler:
         self.base_url = base_url.rstrip("/")
         self.workers = max(1, workers)
         self.request_delay = request_delay
+        self._headers = headers or DEFAULT_HEADERS
+        self._tls = threading.local()
 
-        # 初始化 Session 与重试机制
-        self.session = requests.Session()
-        self.session.headers.update(headers or DEFAULT_HEADERS)
+        self.parser = WyblogsParser(base_url=self.base_url)
+        self.storage = StorageManager(output_dir=output_dir)
+        self.video_downloader = VideoDownloader(session_factory=self.get_session)
+        self.videos_dir = self.storage.videos_dir
+        self.db = ArchiveDatabase(db_path=self.storage.data_dir / "wyblogs_archive.db")
 
+        # 爬取结果列表
+        self.records: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._rate_lock = threading.Lock()
+
+    def _make_session(self) -> requests.Session:
+        session = requests.Session()
+        session.headers.update(self._headers)
         retry_strategy = Retry(
             total=MAX_RETRIES,
             backoff_factor=1,
@@ -48,26 +61,30 @@ class WyblogsCrawler:
             allowed_methods=["HEAD", "GET", "OPTIONS"]
         )
         adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
-        self.parser = WyblogsParser(base_url=self.base_url)
-        self.storage = StorageManager(output_dir=output_dir)
-        self.video_downloader = VideoDownloader(session=self.session)
-        self.videos_dir = self.storage.output_dir / "videos"
-        self.videos_dir.mkdir(parents=True, exist_ok=True)
-        self.db = ArchiveDatabase(db_path=self.storage.data_dir / "wyblogs_archive.db")
+    def get_session(self) -> requests.Session:
+        """每个线程独立的 Session，避免 requests.Session 跨线程共享。"""
+        sess = getattr(self._tls, "session", None)
+        if sess is None:
+            sess = self._make_session()
+            self._tls.session = sess
+        return sess
 
-        # 爬取结果列表
-        self.records: List[Dict[str, Any]] = []
+    @property
+    def session(self) -> requests.Session:
+        return self.get_session()
 
     def fetch_url(self, url: str) -> Optional[str]:
         """请求网页并返回 HTML 字符串"""
         if self.request_delay > 0:
-            time.sleep(self.request_delay)
+            with self._rate_lock:
+                time.sleep(self.request_delay)
 
         try:
-            resp = self.session.get(url, timeout=TIMEOUT)
+            resp = self.get_session().get(url, timeout=TIMEOUT)
             if resp.status_code == 200:
                 # 显式使用 utf-8 解码避免中文乱码
                 resp.encoding = "utf-8"
@@ -102,7 +119,7 @@ class WyblogsCrawler:
 
         # 如果开启了图片下载且存在图片
         if download_images and data.get("images"):
-            downloaded = self.storage.download_post_images(data, self.session)
+            downloaded = self.storage.download_post_images(data, self.get_session())
             data["downloaded_images_count"] = downloaded
 
         # 如果开启了视频下载且存在外链视频
@@ -112,7 +129,8 @@ class WyblogsCrawler:
 
         # 自动沉淀入本地离线数据库
         self.db.save_post(data)
-        self.records.append(data)
+        with self._lock:
+            self.records.append(data)
         return data
 
     def download_post_videos(self, data: Dict[str, Any]) -> List[Path]:
@@ -150,7 +168,7 @@ class WyblogsCrawler:
             out_filename = f"{part_tag}.mp4"
             target_path = post_video_dir / out_filename
 
-            if target_path.exists() and target_path.stat().st_size > 1024 * 50:
+            if target_path.exists() and target_path.stat().st_size > 1024 * 1024:
                 logger.info(f"视频已存在，跳过下载: {target_path.name}")
                 downloaded_files.append(target_path)
                 parts_handled.add(part_tag)
@@ -224,34 +242,67 @@ class WyblogsCrawler:
         total_links = len(all_post_links)
         ui.print_info(f"共收集到 {total_links} 个文章链接，开始多任务抓取正文详情...")
 
-        # 2. 多线程并发爬取文章详情
+        with self._lock:
+            self.records.clear()
+
         results = []
         if total_links > 0:
             with ui.create_counter_progress(unit="篇") as progress:
                 task_id = progress.add_task(f"抓取【{series_label}】文章", total=total_links)
-                if self.workers > 1 and total_links > 1:
-                    with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        future_to_url = {
-                            executor.submit(self.crawl_single_post, url, download_images, download_videos): url
-                            for url in all_post_links
-                        }
-                        for future in as_completed(future_to_url):
-                            url = future_to_url[future]
-                            try:
-                                data = future.result()
-                                if data:
-                                    results.append(data)
-                            except Exception as exc:
-                                logger.error(f"抓取异常 {url}: {exc}")
-                            progress.update(task_id, advance=1)
-                else:
-                    for url in all_post_links:
-                        data = self.crawl_single_post(url, download_images, download_videos)
-                        if data:
-                            results.append(data)
-                        progress.update(task_id, advance=1)
+                results = self._run_jobs(
+                    lambda url: self.crawl_single_post(url, download_images, download_videos),
+                    all_post_links,
+                    progress,
+                    task_id,
+                )
 
         ui.print_success(f"抓取完成！成功抓取 {len(results)}/{total_links} 篇文章")
+        return results
+
+    def _run_jobs(self, fn, items: List[Any], progress, task_id) -> List[Any]:
+        """并发执行任务；工作线程关闭嵌套进度条；Ctrl+C 中止时保留已完成结果。"""
+        results: List[Any] = []
+        if self.workers > 1 and len(items) > 1:
+            executor = ThreadPoolExecutor(max_workers=self.workers)
+
+            def _worker(item):
+                ui.set_worker_ui(False)
+                try:
+                    return fn(item)
+                finally:
+                    ui.set_worker_ui(True)
+
+            try:
+                future_map = {executor.submit(_worker, item): item for item in items}
+                for future in as_completed(future_map):
+                    item = future_map[future]
+                    try:
+                        data = future.result()
+                        if data:
+                            results.append(data)
+                    except Exception as exc:
+                        logger.error(f"抓取异常 {item}: {exc}")
+                    progress.update(task_id, advance=1)
+            except KeyboardInterrupt:
+                ui.print_warning("任务已中止。已完成的抓取结果已保存。")
+                executor.shutdown(wait=False, cancel_futures=True)
+            else:
+                executor.shutdown(wait=True)
+        else:
+            try:
+                for item in items:
+                    try:
+                        data = fn(item)
+                        if data:
+                            results.append(data)
+                    except KeyboardInterrupt:
+                        ui.print_warning("任务已中止。已完成的抓取结果已保存。")
+                        break
+                    except Exception as exc:
+                        logger.error(f"抓取异常 {item}: {exc}")
+                    progress.update(task_id, advance=1)
+            except KeyboardInterrupt:
+                ui.print_warning("任务已中止。已完成的抓取结果已保存。")
         return results
 
     def search_posts(
@@ -279,7 +330,7 @@ class WyblogsCrawler:
             time.sleep(self.request_delay)
 
         try:
-            resp = self.session.get(search_url, timeout=TIMEOUT)
+            resp = self.get_session().get(search_url, timeout=TIMEOUT)
             if resp.status_code != 200:
                 logger.warning(f"搜索请求失败 [{resp.status_code}]: {search_url}")
                 return []
@@ -351,31 +402,18 @@ class WyblogsCrawler:
 
         total_urls = len(unique_urls)
         ui.print_info(f"开始批量抓取，共 {total_urls} 篇文章...")
+        with self._lock:
+            self.records.clear()
         results = []
 
         with ui.create_counter_progress(unit="篇") as progress:
             task_id = progress.add_task("抓取指定文章", total=total_urls)
-            if self.workers > 1 and total_urls > 1:
-                with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                    future_to_url = {
-                        executor.submit(self.crawl_single_post, url, download_images, download_videos): url
-                        for url in unique_urls
-                    }
-                    for future in as_completed(future_to_url):
-                        url = future_to_url[future]
-                        try:
-                            data = future.result()
-                            if data:
-                                results.append(data)
-                        except Exception as exc:
-                            logger.error(f"抓取异常 {url}: {exc}")
-                        progress.update(task_id, advance=1)
-            else:
-                for url in unique_urls:
-                    data = self.crawl_single_post(url, download_images, download_videos)
-                    if data:
-                        results.append(data)
-                    progress.update(task_id, advance=1)
+            results = self._run_jobs(
+                lambda url: self.crawl_single_post(url, download_images, download_videos),
+                unique_urls,
+                progress,
+                task_id,
+            )
 
         ui.print_success(f"批量抓取完成！成功获取 {len(results)}/{total_urls} 篇文章")
         return results
@@ -390,10 +428,15 @@ class WyblogsCrawler:
         filename = f"search_results_{safe_kw}_{timestamp}.csv"
         return self.storage.save_search_list_to_csv(results, filename)
 
-    def export(self, filename_prefix: str = "wyblogs_crawl") -> Dict[str, str]:
-        """导出抓取结果数据"""
-        json_path = self.storage.save_records_to_json(self.records, f"{filename_prefix}.json")
-        csv_path = self.storage.save_records_to_csv(self.records, f"{filename_prefix}.csv")
+    def export(
+        self,
+        filename_prefix: str = "wyblogs_crawl",
+        records: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, str]:
+        """导出抓取结果数据。传入 records 时只导出该批次，避免混入历史任务。"""
+        data = self.records if records is None else records
+        json_path = self.storage.save_records_to_json(data, f"{filename_prefix}.json")
+        csv_path = self.storage.save_records_to_csv(data, f"{filename_prefix}.csv")
         return {
             "json": str(json_path),
             "csv": str(csv_path)
@@ -477,26 +520,8 @@ class WyblogsCrawler:
                 self.db.save_post(data)
                 return data
 
-            if self.workers > 1 and total_pending > 1:
-                with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                    futures = [executor.submit(_worker, u) for u in all_new_urls]
-                    for f in as_completed(futures):
-                        try:
-                            res = f.result()
-                            if res:
-                                archived_count += 1
-                        except Exception as e:
-                            logger.error(f"归档异常: {e}")
-                        progress.update(task_id, advance=1)
-            else:
-                for u in all_new_urls:
-                    try:
-                        res = _worker(u)
-                        if res:
-                            archived_count += 1
-                    except Exception as e:
-                        logger.error(f"归档异常: {e}")
-                    progress.update(task_id, advance=1)
+            archived = self._run_jobs(_worker, all_new_urls, progress, task_id)
+            archived_count = len(archived)
 
         ui.print_success(f"【{series_label}】本次归档完成！成功入库 {archived_count} 篇文章")
         return self.db.get_stats()
@@ -505,21 +530,21 @@ class WyblogsCrawler:
         self,
         post_data: Dict[str, Any],
         download_images: bool = False,
-        download_videos: bool = False
+        download_videos: bool = False,
+        save_novel_txt: bool = False,
     ) -> Dict[str, Any]:
         """
         从本地已归档的数据中直接调取真实链接下载对应媒体，完全无需再次网络请求网页！
+        小说 TXT 仅在 save_novel_txt=True 时写出。
         """
         result = dict(post_data)
 
-        # 1. 小说 TXT 保存
-        if post_data.get("content_type") == "novel" and post_data.get("text"):
+        if save_novel_txt and post_data.get("content_type") == "novel" and post_data.get("text"):
             txt_path = self.storage.save_novel(post_data)
             result["saved_novel_path"] = str(txt_path)
 
-        # 2. 从本地已存图片链接批量下载高清原图
         if download_images and post_data.get("images"):
-            downloaded = self.storage.download_post_images(post_data, self.session)
+            downloaded = self.storage.download_post_images(post_data, self.get_session())
             result["downloaded_images_count"] = downloaded
 
         # 3. 从本地已存视频直链批量解析/下载真实 MP4
