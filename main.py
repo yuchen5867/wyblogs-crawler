@@ -238,6 +238,9 @@ def interactive_search(
         })
         return
 
+    print_success(f"检索完成！共获取 {len(results)} 条结果。")
+    print_info("提示：列表界面顶部已启用筛选工具栏，随时按 [F] 键可按专区(小说/写真/视频)或标题/正文就地筛选！")
+
     # 现代化交互式多页表格浏览与自选下载（无重复滚屏，支持空格勾选、左右翻页）
     action, selected_posts = browse_and_select_posts(
         results,
@@ -385,6 +388,7 @@ def interactive_local_search(crawler: WyblogsCrawler):
         return
 
     print_success(f"本地检索完成！共命中 {len(results)} 条记录。")
+    print_info("提示：列表界面顶部已启用筛选工具栏，随时按 [F] 键可按专区或标题/正文就地筛选！")
     if len(results) >= 1000:
         print_warning("结果已达 1000 条上限，仅显示前 1000 条。可缩小关键词或加专区过滤。")
 

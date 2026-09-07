@@ -8,7 +8,7 @@ import threading
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.theme import Theme
 from rich.panel import Panel
 from rich.table import Table
@@ -166,7 +166,7 @@ def build_menu_panel(menu_items: List[Any], selected_index: int, title: str = "�
         box=box.ROUNDED,
         border_style="bright_blue",
         padding=(0, 1),
-        subtitle="[dim]↑/↓ 上下移动光标 │ [Enter] 确定选中 │ 按对应编号直达 │ [q] 退出[/dim]",
+        subtitle="[dim]↑/↓ 上下移动光标 │ [Enter] 确定选中 │ 按对应编号直达 │ \\[q] 退出[/dim]",
         subtitle_align="center"
     )
     return panel
@@ -248,7 +248,7 @@ def select_option(
             box=box.ROUNDED,
             border_style="bright_blue",
             padding=(0, 1),
-            subtitle="[dim]↑/↓ 上下移动光标 │ [Enter] 确定选择 │ [q/ESC] 取消[/dim]",
+            subtitle="[dim]↑/↓ 上下移动光标 │ [Enter] 确定选择 │ \\[q/ESC] 取消[/dim]",
             subtitle_align="center"
         )
         return panel
@@ -441,7 +441,37 @@ def build_browser_panel(
     active_match_filter: str = "all",
     raw_total: int = 0
 ) -> Panel:
-    """构建多页文章交互式浏览器面板（含光标、复选框、板块胶囊、匹配来源、日期与直链信息）"""
+    """构建多页文章交互式浏览器面板（含筛选状态栏、操作快捷键、光标、复选框、板块胶囊、匹配来源、日期与直链信息）"""
+    cnt_info = f"共 [bold green]{len(results)}[/bold green] 条"
+    if raw_total > 0 and raw_total != len(results):
+        cnt_info = f"已筛选 [bold green]{len(results)}[/bold green]/{raw_total} 条"
+
+    s_label = f"[bold bright_yellow]【{active_series_filter}】[/bold bright_yellow]" if active_series_filter != "all" else "[bold white]【全部专区】[/bold white]"
+    if active_match_filter == "title":
+        m_label = "[bold bright_green]【仅标题命中】[/bold bright_green]"
+    elif active_match_filter == "body":
+        m_label = "[bold bright_cyan]【仅正文命中】[/bold bright_cyan]"
+    else:
+        m_label = "[bold white]【全部来源】[/bold white]"
+
+    has_kw = bool(keyword and str(keyword).strip())
+
+    # 顶部显式筛选状态与操作快捷栏（高亮醒目，界面顶部直观可见）
+    toolbar = Table.grid(expand=True, padding=(0, 1))
+    toolbar.add_column()
+    toolbar.add_row(
+        f" [bold bright_white]当前筛选状态:[/bold bright_white] 专区: {s_label}  │  来源: {m_label}  [dim]({cnt_info})[/dim]"
+    )
+    toolbar.add_row(
+        " [bold bright_white]快捷操作指南:[/bold bright_white] "
+        "[bold bright_yellow]\\[F] 专区/匹配即时筛选[/bold bright_yellow]  │  "
+        "[bold bright_cyan]\\[Space] 勾选/取消[/bold bright_cyan]  │  "
+        "[bold white]\\[←/→] 翻页[/bold white]  │  "
+        "[bold bright_green]\\[Enter] 确认下载[/bold bright_green]  │  "
+        "[bold dim red]\\[Q] 返回[/bold dim red]"
+    )
+    toolbar.add_row("")
+
     table = Table(
         box=box.ROUNDED,
         border_style="dim blue",
@@ -452,6 +482,8 @@ def build_browser_panel(
     table.add_column("选择", width=7, justify="center")
     table.add_column("#", style="bold cyan", width=5, justify="center")
     table.add_column("板块", width=8, justify="center")
+    if has_kw:
+        table.add_column("匹配来源", width=10, justify="center")
     table.add_column("标题", ratio=3, no_wrap=False)
     table.add_column("发布日期", width=12, justify="center")
     table.add_column("附加信息 / 直链信息", ratio=2, no_wrap=False)
@@ -461,11 +493,14 @@ def build_browser_panel(
     page_items = results[start_idx:end_idx]
 
     if not page_items:
-        table.add_row(
-            "", "", "",
-            "[dim italic]当前筛选条件下无匹配文章，按 [bold bright_cyan][f][/bold bright_cyan] 可重新筛选或重置[/dim italic]",
+        empty_cols = ["", "", ""]
+        if has_kw:
+            empty_cols.append("")
+        empty_cols.extend([
+            "[dim italic]当前筛选条件下无匹配文章，按 [bold bright_yellow]\\[F][/bold bright_yellow] 可重新筛选或重置[/dim italic]",
             "", ""
-        )
+        ])
+        table.add_row(*empty_cols)
     else:
         for row_idx, item in enumerate(page_items):
             global_idx = start_idx + row_idx
@@ -497,13 +532,13 @@ def build_browser_panel(
             date_val = escape(str(item.get("date", "-") or "-"))
             date_cell = f"[bold bright_white]{date_val}[/bold bright_white]" if is_cursor else f"[dim]{date_val}[/dim]"
 
-            meta_parts = []
-            if keyword:
+            match_cell = ""
+            if has_kw:
                 m_type = classify_post_match(item, keyword)
                 m_badge = get_match_badge(m_type)
-                if m_badge:
-                    meta_parts.append(m_badge)
+                match_cell = m_badge if m_badge else "[dim]-[/dim]"
 
+            meta_parts = []
             if item.get("word_count"):
                 meta_parts.append(str(item["word_count"]))
             if item.get("images_count"):
@@ -519,7 +554,10 @@ def build_browser_panel(
             meta_str = " | ".join(meta_parts) if meta_parts else "-"
             meta_cell = f"[bright_cyan]{meta_str}[/bright_cyan]" if is_cursor else f"[dim cyan]{meta_str}[/dim cyan]"
 
-            table.add_row(sel_cell, num_cell, badge, title_cell, date_cell, meta_cell)
+            if has_kw:
+                table.add_row(sel_cell, num_cell, badge, match_cell, title_cell, date_cell, meta_cell)
+            else:
+                table.add_row(sel_cell, num_cell, badge, title_cell, date_cell, meta_cell)
 
     kw_info = f" · 关键词: '{escape(str(keyword))}'" if keyword else ""
 
@@ -531,21 +569,24 @@ def build_browser_panel(
         filter_tags.append(f"来源: {m_name}")
     filter_str = f" [{' | '.join(filter_tags)}]" if filter_tags else ""
 
-    cnt_info = f"共 [bold green]{len(results)}[/bold green] 条"
-    if raw_total > 0 and raw_total != len(results):
-        cnt_info = f"筛选后 [bold green]{len(results)}[/bold green]/{raw_total} 条"
-
     sel_cnt = len(selected_urls) if isinstance(selected_urls, set) else len(selected_urls)
     page_nav = f"第 [bold cyan]{current_page}[/bold cyan] / [bold cyan]{total_pages}[/bold cyan] 页  │  {cnt_info}{filter_str}  │  已勾选 [bold bright_yellow]{sel_cnt}[/bold bright_yellow] 篇{kw_info}"
 
     panel = Panel(
-        table,
+        Group(toolbar, table),
         title=f"[bold bright_white]── {title} ({page_nav}) ──[/bold bright_white]",
         title_align="left",
         box=box.ROUNDED,
         border_style="bright_blue",
         padding=(0, 0),
-        subtitle="[dim]↑/↓ 移动光标 │ [Space] 勾选/取消 │ ←/→ 翻页 │ [f] 专区/匹配筛选 │ [a] 全选 │ [Enter] 确定下载 │ [e] 导出清单 │ [q] 返回[/dim]",
+        subtitle=(
+            "[bold bright_yellow]\\[F] 筛选[/bold bright_yellow] │ "
+            "[bold bright_cyan]\\[Space] 勾选[/bold bright_cyan] │ "
+            "[bold white]\\[←/→] 翻页[/bold white] │ "
+            "[bold bright_green]\\[Enter] 下载[/bold bright_green] │ "
+            "[bold magenta]\\[E] 导出[/bold magenta] │ "
+            "[bold dim red]\\[Q] 返回[/bold dim red]"
+        ),
         subtitle_align="center"
     )
     return panel
@@ -715,7 +756,7 @@ def browse_and_select_posts(
                     for i, it in enumerate(current_results):
                         selected_items_map[all_curr_urls[i]] = it
 
-            elif k in ("f", "F"):
+            elif k in ("f", "F", "s", "S", "/"):
                 # 动态统计各专区与匹配类型的数量
                 novel_cnt = sum(1 for x in raw_results if "小" in str(x.get("series") or "") or "小" in str(x.get("categorys") or ""))
                 photo_cnt = sum(1 for x in raw_results if "寫" in str(x.get("series") or "") or "写" in str(x.get("series") or "") or "寫" in str(x.get("categorys") or ""))
@@ -784,6 +825,20 @@ def browse_and_select_posts(
                 total_pages = max(1, (len(current_results) + page_size - 1) // page_size)
                 current_page = 1
                 cursor_row = 0
+
+            elif k in ("t", "T"):
+                # 快捷键快速循环切换匹配来源：全部 -> 仅标题 -> 仅正文 -> 全部
+                if keyword:
+                    if active_match_filter == "all":
+                        active_match_filter = "title"
+                    elif active_match_filter == "title":
+                        active_match_filter = "body"
+                    else:
+                        active_match_filter = "all"
+                    current_results = apply_filters(raw_results, active_series_filter, active_match_filter)
+                    total_pages = max(1, (len(current_results) + page_size - 1) // page_size)
+                    current_page = 1
+                    cursor_row = 0
 
             elif k in ("ENTER", "\r", "\n"):
                 if not selected_items_map:
@@ -884,7 +939,7 @@ def render_search_table(
         box=box.ROUNDED,
         border_style="bright_blue",
         padding=(0, 0),
-        subtitle="[dim]指令: 输入编号多选(如 '1' 或 '1,3-5' 或 'all') │ [n] 下一页 │ [p] 上一页 │ [e] 导出清单 │ [q] 返回[/dim]",
+        subtitle="[dim]指令: 输入编号多选(如 '1' 或 '1,3-5' 或 'all') │ \\[n] 下一页 │ \\[p] 上一页 │ \\[e] 导出清单 │ \\[q] 返回[/dim]",
         subtitle_align="center"
     )
     console.print(panel)
